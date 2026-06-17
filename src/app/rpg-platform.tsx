@@ -51,6 +51,14 @@ type ArenaState = {
   enemySpin: number;
 };
 
+type ImpactState = {
+  active: boolean;
+  key: number;
+  event: string;
+};
+
+type BattlePhase = "idle" | "matchup" | "countdown" | "fighting" | "result";
+
 function createDefaultGameState(): GameState {
   return {
     selectedId: "龍",
@@ -70,10 +78,23 @@ export function RpgPlatform() {
   const [statusMessage, setStatusMessage] = useState("先選一個字，再在字帖上寫出來。");
   const [arenaState, setArenaState] = useState<ArenaState | null>(null);
   const [battleIndex, setBattleIndex] = useState(0);
+  const [battlePhase, setBattlePhase] = useState<BattlePhase>("idle");
+  const [countdown, setCountdown] = useState(3);
+  const [impactState, setImpactState] = useState<ImpactState>({
+    active: false,
+    key: 0,
+    event: "",
+  });
+  const [announcerText, setAnnouncerText] = useState("等待開戰");
   const referenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
+  const phaseTimerRef = useRef<number | null>(null);
+  const impactTimerRef = useRef<number | null>(null);
+  const impactActiveRef = useRef(false);
+  const battlePhaseRef = useRef<BattlePhase>("idle");
+  const collisionActiveRef = useRef(false);
 
   const selectedCharacter = useMemo(() => getCharacter(game.selectedId), [game.selectedId]);
   const canvasSize = getCanvasSize();
@@ -127,6 +148,14 @@ export function RpgPlatform() {
   }, [game.strokes]);
 
   useEffect(() => {
+    impactActiveRef.current = impactState.active;
+  }, [impactState.active]);
+
+  useEffect(() => {
+    battlePhaseRef.current = battlePhase;
+  }, [battlePhase]);
+
+  useEffect(() => {
     const battle = game.battle;
 
     if (!battle) {
@@ -138,6 +167,19 @@ export function RpgPlatform() {
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
       }
+      if (phaseTimerRef.current) {
+        window.clearTimeout(phaseTimerRef.current);
+        phaseTimerRef.current = null;
+      }
+      if (impactTimerRef.current) {
+        window.clearTimeout(impactTimerRef.current);
+        impactTimerRef.current = null;
+      }
+      setBattlePhase("idle");
+      setCountdown(3);
+      setImpactState({ active: false, key: 0, event: "" });
+      setAnnouncerText("等待開戰");
+      collisionActiveRef.current = false;
       return;
     }
 
@@ -145,17 +187,51 @@ export function RpgPlatform() {
     let frame = 0;
     let currentIndex = 0;
 
+    setBattleIndex(0);
+    setCountdown(3);
+    setBattlePhase("matchup");
+    setStatusMessage(`對戰配對完成：${battle.playerTop.characterId} vs ${battle.enemyTop.characterId}`);
+    setAnnouncerText(`${battle.playerTop.characterId} 對上 ${battle.enemyTop.characterId}`);
+    collisionActiveRef.current = false;
+
     const animate = () => {
       const currentLog = logs[Math.min(currentIndex, logs.length - 1)];
-      const orbit = 82 - currentIndex * 4;
+      const orbit = Math.max(44, 98 - currentIndex * 6);
       const angle = frame * 0.045;
+      const shakeX = impactActiveRef.current ? Math.sin(frame * 1.2) * 4 : 0;
+      const shakeY = impactActiveRef.current ? Math.cos(frame * 0.9) * 3 : 0;
+      const playerRadius = 18 + battle.playerTop.stats.weight * 0.12;
+      const enemyRadius = 18 + battle.enemyTop.stats.weight * 0.12;
+      const playerX = 160 + Math.cos(angle) * orbit + shakeX;
+      const playerY = 160 + Math.sin(angle) * orbit * 0.82 + shakeY;
+      const enemyX = 160 + Math.cos(angle + Math.PI) * orbit - shakeX;
+      const enemyY = 160 + Math.sin(angle + Math.PI) * orbit * 0.82 - shakeY;
+      const distance = Math.hypot(playerX - enemyX, playerY - enemyY);
+      const colliding = distance <= (playerRadius + enemyRadius) * 0.92;
+
+      if (battlePhaseRef.current === "fighting" && colliding && !collisionActiveRef.current) {
+        const impactEvent = currentLog.event || "碰撞爆發";
+        setImpactState((previous) => ({
+          active: true,
+          key: previous.key + 1,
+          event: impactEvent,
+        }));
+        if (impactTimerRef.current) {
+          window.clearTimeout(impactTimerRef.current);
+        }
+        impactTimerRef.current = window.setTimeout(() => {
+          setImpactState((previous) => ({ ...previous, active: false }));
+        }, 320);
+      }
+
+      collisionActiveRef.current = colliding;
       setArenaState({
-        playerX: 160 + Math.cos(angle) * orbit,
-        playerY: 160 + Math.sin(angle) * orbit * 0.82,
-        enemyX: 160 + Math.cos(angle + Math.PI) * orbit,
-        enemyY: 160 + Math.sin(angle + Math.PI) * orbit * 0.82,
-        playerRadius: 18 + battle.playerTop.stats.weight * 0.12,
-        enemyRadius: 18 + battle.enemyTop.stats.weight * 0.12,
+        playerX,
+        playerY,
+        enemyX,
+        enemyY,
+        playerRadius,
+        enemyRadius,
         playerSpin: currentLog.playerSpin,
         enemySpin: currentLog.enemySpin,
       });
@@ -169,16 +245,73 @@ export function RpgPlatform() {
       setBattleIndex((value) => {
         const nextValue = Math.min(value + 1, logs.length - 1);
         currentIndex = nextValue;
+        const current = logs[nextValue];
+        const eventText = current.event
+          ? current.event
+          : current.playerDamage > current.enemyDamage
+            ? "重擊命中"
+            : current.playerDamage < current.enemyDamage
+              ? "對手壓制"
+              : "正面碰撞";
+        setStatusMessage(
+          current.event
+            ? `第 ${current.round} 回合：${current.event}`
+            : `第 ${current.round} 回合交鋒中，雙方持續削減轉速。`
+        );
+        setAnnouncerText(`R${current.round}｜${eventText}`);
         return nextValue;
       });
 
       if (currentIndex < logs.length - 1) {
         timerRef.current = window.setTimeout(stepLogs, 950);
+      } else {
+        phaseTimerRef.current = window.setTimeout(() => {
+          setBattlePhase("result");
+          setAnnouncerText(
+            battle.winner === "player"
+              ? "玩家戰陀勝出"
+              : battle.winner === "enemy"
+                ? "敵方戰陀勝出"
+                : "雙方平手"
+          );
+          setStatusMessage(
+            battle.winner === "player"
+              ? "比賽結束，玩家戰陀獲勝。"
+              : battle.winner === "enemy"
+                ? "比賽結束，敵方戰陀獲勝。"
+                : "比賽結束，雙方平手。"
+          );
+        }, 900);
       }
     };
 
-    setBattleIndex(0);
-    timerRef.current = window.setTimeout(stepLogs, 950);
+    phaseTimerRef.current = window.setTimeout(() => {
+      setBattlePhase("countdown");
+      setStatusMessage("戰鬥倒數開始。");
+      setAnnouncerText("進入倒數");
+      setCountdown(3);
+
+      const runCountdown = (value: number) => {
+        if (value <= 1) {
+          setCountdown(1);
+          phaseTimerRef.current = window.setTimeout(() => {
+            setBattlePhase("fighting");
+            setStatusMessage("Fight!");
+            setAnnouncerText("Fight!");
+            setCountdown(0);
+            timerRef.current = window.setTimeout(stepLogs, 400);
+          }, 700);
+          return;
+        }
+
+        phaseTimerRef.current = window.setTimeout(() => {
+          setCountdown(value - 1);
+          runCountdown(value - 1);
+        }, 700);
+      };
+
+      runCountdown(3);
+    }, 900);
 
     return () => {
       if (rafRef.current) {
@@ -189,6 +322,15 @@ export function RpgPlatform() {
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
       }
+      if (phaseTimerRef.current) {
+        window.clearTimeout(phaseTimerRef.current);
+        phaseTimerRef.current = null;
+      }
+      if (impactTimerRef.current) {
+        window.clearTimeout(impactTimerRef.current);
+        impactTimerRef.current = null;
+      }
+      collisionActiveRef.current = false;
     };
   }, [game.battle]);
 
@@ -286,6 +428,9 @@ export function RpgPlatform() {
       startedAt: null,
       finishedAt: null,
     }));
+    setBattlePhase("idle");
+    setImpactState({ active: false, key: 0, event: "" });
+    setAnnouncerText("等待開戰");
     setStatusMessage("畫布已清空。");
   }
 
@@ -300,6 +445,9 @@ export function RpgPlatform() {
       startedAt: null,
       finishedAt: null,
     }));
+    setBattlePhase("idle");
+    setImpactState({ active: false, key: 0, event: "" });
+    setAnnouncerText("等待開戰");
     setStatusMessage(`已切換到「${character.id}」，難度 ${character.difficulty}。`);
   }
 
@@ -343,6 +491,14 @@ export function RpgPlatform() {
   }
 
   const currentLog = game.battle?.logs[Math.min(battleIndex, Math.max((game.battle?.logs.length ?? 1) - 1, 0))];
+  const revealedResult = battlePhase === "result";
+  const visibleLogs = game.battle?.logs.slice(0, battlePhase === "fighting" || battlePhase === "result" ? battleIndex + 1 : 0) ?? [];
+  const playerSpinMax = game.battle ? 100 + game.battle.playerTop.stats.stability * 0.6 + game.battle.playerTop.stats.weight * 0.2 : 100;
+  const enemySpinMax = game.battle ? 100 + game.battle.enemyTop.stats.stability * 0.6 + game.battle.enemyTop.stats.weight * 0.2 : 100;
+  const playerSpinPercent = arenaState ? Math.max(0, Math.min(100, (arenaState.playerSpin / playerSpinMax) * 100)) : 100;
+  const enemySpinPercent = arenaState ? Math.max(0, Math.min(100, (arenaState.enemySpin / enemySpinMax) * 100)) : 100;
+  const playerEffect = getCharacterEffect(game.playerTop?.characterId);
+  const enemyEffect = getCharacterEffect(game.battle?.enemyTop.characterId);
 
   return (
     <main className="app-shell">
@@ -506,10 +662,66 @@ export function RpgPlatform() {
             <Swords size={18} />
             <h2>戰鬥場</h2>
           </div>
+          {game.battle ? (
+            <div className="battle-hud">
+              <SpinMeter
+                label={game.battle.playerTop.name}
+                value={arenaState?.playerSpin ?? playerSpinMax}
+                percent={playerSpinPercent}
+                align="left"
+              />
+              <div className={`announcer ${impactState.active ? "announcer-impact" : ""}`}>
+                <span className="announcer-chip">{battlePhase.toUpperCase()}</span>
+                <strong>{announcerText}</strong>
+              </div>
+              <SpinMeter
+                label={revealedResult ? game.battle.enemyTop.name : "敵方戰陀"}
+                value={arenaState?.enemySpin ?? enemySpinMax}
+                percent={enemySpinPercent}
+                align="right"
+              />
+            </div>
+          ) : null}
           <div className="arena">
             <div className="arena-ring" />
+            {impactState.active ? <div key={impactState.key} className="impact-flash" /> : null}
+            {game.battle && battlePhase === "matchup" ? (
+              <div className="arena-overlay">
+                <p className="overlay-kicker">Match Up</p>
+                <div className="versus-row">
+                  <strong>{game.battle.playerTop.characterId}</strong>
+                  <span>VS</span>
+                  <strong>{game.battle.enemyTop.characterId}</strong>
+                </div>
+                <p className="overlay-subtext">
+                  {game.battle.playerTop.name} 對上 {game.battle.enemyTop.name}
+                </p>
+              </div>
+            ) : null}
+            {game.battle && battlePhase === "countdown" ? (
+              <div className="arena-overlay countdown-overlay">
+                <p className="countdown-number">{countdown}</p>
+              </div>
+            ) : null}
+            {game.battle && battlePhase === "result" ? (
+              <div className="arena-banner">
+                {game.battle.winner === "player"
+                  ? "WIN"
+                  : game.battle.winner === "enemy"
+                    ? "LOSE"
+                    : "DRAW"}
+              </div>
+            ) : null}
+            <TopEffect
+              effect={playerEffect}
+              left={arenaState?.playerX ?? 84}
+              top={arenaState?.playerY ?? 160}
+              radius={arenaState?.playerRadius ?? 22}
+              active={battlePhase === "fighting"}
+              impactActive={impactState.active}
+            />
             <div
-              className="top-token player-token"
+              className={`top-token player-token ${battlePhase === "fighting" ? "top-fast" : ""} ${impactState.active ? "top-impact" : ""}`}
               style={{
                 left: `${arenaState?.playerX ?? 84}px`,
                 top: `${arenaState?.playerY ?? 160}px`,
@@ -519,8 +731,16 @@ export function RpgPlatform() {
             >
               {game.playerTop?.characterId ?? "P"}
             </div>
+            <TopEffect
+              effect={enemyEffect}
+              left={arenaState?.enemyX ?? 236}
+              top={arenaState?.enemyY ?? 160}
+              radius={arenaState?.enemyRadius ?? 22}
+              active={battlePhase === "fighting"}
+              impactActive={impactState.active}
+            />
             <div
-              className="top-token enemy-token"
+              className={`top-token enemy-token ${battlePhase === "fighting" ? "top-fast" : ""} ${impactState.active ? "top-impact" : ""}`}
               style={{
                 left: `${arenaState?.enemyX ?? 236}px`,
                 top: `${arenaState?.enemyY ?? 160}px`,
@@ -534,17 +754,23 @@ export function RpgPlatform() {
           {game.battle ? (
             <div className="detail-grid">
               <InfoRow label={game.battle.playerTop.name} value={`轉速 ${arenaState?.playerSpin ?? 0}`} />
-              <InfoRow label={game.battle.enemyTop.name} value={`轉速 ${arenaState?.enemySpin ?? 0}`} />
               <InfoRow
-                label="勝負"
-                value={
-                  game.battle.winner === "player"
-                    ? "玩家勝"
-                    : game.battle.winner === "enemy"
-                      ? "敵方勝"
-                      : "平手"
-                }
+                label={revealedResult ? game.battle.enemyTop.name : "未知敵方戰陀"}
+                value={`轉速 ${arenaState?.enemySpin ?? 0}`}
               />
+              <InfoRow label="比賽階段" value={battlePhase === "result" ? "結果揭露" : battlePhase === "fighting" ? "戰鬥進行中" : battlePhase === "countdown" ? "倒數準備" : "對陣展示"} />
+              {revealedResult ? (
+                <InfoRow
+                  label="勝負"
+                  value={
+                    game.battle.winner === "player"
+                      ? "玩家勝"
+                      : game.battle.winner === "enemy"
+                        ? "敵方勝"
+                        : "平手"
+                  }
+                />
+              ) : null}
             </div>
           ) : (
             <p className="panel-text">完成評分後，即可用你的字生成戰陀並挑戰 AI 對手。</p>
@@ -561,17 +787,24 @@ export function RpgPlatform() {
               <div className="info-row">
                 <span>對手</span>
                 <strong>
-                  {game.battle.enemyTop.characterId}｜{game.battle.enemyTop.grade}｜{game.battle.enemyTop.name}
+                  {revealedResult
+                    ? `${game.battle.enemyTop.characterId}｜${game.battle.enemyTop.grade}｜${game.battle.enemyTop.name}`
+                    : "對戰中，資料揭露鎖定"}
                 </strong>
               </div>
-              <div className="stats-grid">
-                <StatCard label="重" value={game.battle.enemyTop.stats.weight} />
-                <StatCard label="穩" value={game.battle.enemyTop.stats.stability} />
-                <StatCard label="攻" value={game.battle.enemyTop.stats.attack} />
-                <StatCard label="防" value={game.battle.enemyTop.stats.defense} />
-              </div>
+              {revealedResult ? (
+                <div className="stats-grid">
+                  <StatCard label="重" value={game.battle.enemyTop.stats.weight} />
+                  <StatCard label="穩" value={game.battle.enemyTop.stats.stability} />
+                  <StatCard label="攻" value={game.battle.enemyTop.stats.attack} />
+                  <StatCard label="防" value={game.battle.enemyTop.stats.defense} />
+                </div>
+              ) : null}
               <div className="log-box tall">
-                {game.battle.logs.map((log) => (
+                {visibleLogs.length === 0 ? (
+                  <p className="panel-text">過場播放中，戰報尚未開始。</p>
+                ) : null}
+                {visibleLogs.map((log) => (
                   <div key={log.round} className="record-item battle-record">
                     <strong>R{log.round}</strong>
                     <span>你造成 {log.playerDamage}</span>
@@ -597,6 +830,19 @@ export function RpgPlatform() {
   );
 }
 
+function getCharacterEffect(characterId?: CharacterId) {
+  if (characterId === "火") {
+    return "fire";
+  }
+  if (characterId === "風") {
+    return "wind";
+  }
+  if (characterId === "霸") {
+    return "shock";
+  }
+  return "none";
+}
+
 function StatCard({ label, value }: { label: string; value: number }) {
   return (
     <div className="stat-card">
@@ -615,4 +861,87 @@ function InfoRow({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function SpinMeter({
+  label,
+  value,
+  percent,
+  align,
+}: {
+  label: string;
+  value: number;
+  percent: number;
+  align: "left" | "right";
+}) {
+  return (
+    <div className={`spin-meter ${align}`}>
+      <div className="spin-meter-head">
+        <span>{label}</span>
+        <strong>{Math.round(value)}</strong>
+      </div>
+      <div className="spin-meter-track">
+        <div className="spin-meter-fill" style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function TopEffect({
+  effect,
+  left,
+  top,
+  radius,
+  active,
+  impactActive,
+}: {
+  effect: "fire" | "wind" | "shock" | "none";
+  left: number;
+  top: number;
+  radius: number;
+  active: boolean;
+  impactActive: boolean;
+}) {
+  if (effect === "none") {
+    return null;
+  }
+
+  const size = radius + 20;
+
+  if (effect === "fire") {
+    return (
+      <div
+        className={`fx-anchor ${active ? "fx-visible" : ""}`}
+        style={{ left: `${left}px`, top: `${top}px`, width: `${size}px`, height: `${size}px` }}
+      >
+        <div className="fire-tail" />
+      </div>
+    );
+  }
+
+  if (effect === "wind") {
+    return (
+      <div
+        className={`fx-anchor ${active ? "fx-visible" : ""}`}
+        style={{ left: `${left}px`, top: `${top}px`, width: `${size + 16}px`, height: `${size + 16}px` }}
+      >
+        <div className="wind-echo wind-echo-1" />
+        <div className="wind-echo wind-echo-2" />
+        <div className="wind-echo wind-echo-3" />
+      </div>
+    );
+  }
+
+  if (effect === "shock" && impactActive) {
+    return (
+      <div
+        className="fx-anchor fx-visible"
+        style={{ left: `${left}px`, top: `${top}px`, width: `${size + 22}px`, height: `${size + 22}px` }}
+      >
+        <div className="shockwave-ring" />
+      </div>
+    );
+  }
+
+  return null;
 }
